@@ -443,6 +443,7 @@ function newDeck(idx){
     playing:false, pos:0, startStamp:0, startPos:0, rate:1, pitchPct:0, source:null,
     sync:true, reverse:false, transient:null, angle:0,
     loop:null, loopSize:8, safetyOn:true, safetyCaught:false,
+    phaseRef:undefined, lastBar:-1,
     cues:new Array(8).fill(null), gainKnob:0.5, faderVal:0, muted:false,
     rms:0, peak:0, meterPeak:0, meterHold:0, bjSize:4, scrubbing:false,
     loudRMS:0, loudPeak:1, removed:false, side:null, ch:idx+1};
@@ -458,6 +459,44 @@ function aliveDecks(){ return decks.filter(d=>!d.removed); }
 function chOf(d){ const o=channelOrder(); const n=o.indexOf(d.idx); return n>=0?n+1:d.idx+1; }
 function stripCountTarget(){ return aliveDecks().length>=3?4:2; } // owner rule: 3rd device -> mixer grows 2 -> 4 strips
 function beatLen(d){return 60/d.bpm;} function barLen(d){return 4*beatLen(d);}
+/* display-only BPM rounding — internals always keep full precision (see detectBPM) */
+function fmtBPM(x){ if(x==null||!isFinite(x))return "—"; return String(Math.round(x*10)/10); }
+/* loop length in track-seconds. SYNC on: derived from the MASTER's beat length
+   (sizeBeats × 60/masterBPM × this deck's sync rate), so the loop spans an exact
+   number of master beats and every wrap can land on the shared grid. */
+function loopSeconds(d,sizeBeats){ const m=decks[syncMasterIdx];
+  if(d.sync&&m&&m!==d&&m.buffer&&d.buffer) return sizeBeats*(60/m.bpm)*computeRate(d);
+  return sizeBeats*beatLen(d); }
+/* wrapped within-beat phase difference (deck − master) in beats, range [-0.5, 0.5) */
+function phaseDiffBeats(d){ const m=decks[syncMasterIdx];
+  if(!m||m===d||!m.buffer||!m.playing||!d.buffer)return null;
+  const fr=x=>x-Math.floor(x); const e=fr(getPos(d)/beatLen(d))-fr(getPos(m)/beatLen(m));
+  return e>=0.5?e-1:(e<-0.5?e+1:e); }
+function samplePhaseRef(d){ const pd=phaseDiffBeats(d); if(pd!==null)d.phaseRef=pd; }
+/* The position a synced deck must occupy at a loop wrap. Starts from the natural
+   deck-local wrap (region start + overshoot, so playback is continuous), then
+   shifts by the deck's CURRENT phase error against the Sync Master — measured
+   fresh at this wrap — so the error is zeroed every cycle and can NEVER
+   compound, whatever the loop/safety cycle length. The deck's sampled standing
+   offset (phaseRef) is preserved, so a file whose beat 0 sits off the grid
+   keeps its offset. Residual error after a wrap is bounded by one cycle of
+   tempo error plus grid mismatch at the region start — it does not grow.
+   Returns null when there is no live master reference (free behaviour). */
+function masterLoopTarget(d,start,len,sizeBeats){
+  const m=decks[syncMasterIdx];
+  if(!d.sync||!m||m===d||!m.playing||!m.buffer||!d.buffer||d.reverse||m.transient)return null;
+  const end=start+len, p=getPos(d);
+  const fr=x=>x-Math.floor(x);
+  const local=start+Math.max(0,p-end);   // the uncorrected deck-local restart position
+  /* phase error of the RESTART position (not of p — the engine may fire up to
+     ~20 ms before the region end, and p's phase differs from the restart
+     position's phase by exactly that distance) */
+  let err=fr(local/beatLen(d))-(fr(getPos(m)/beatLen(m))+(d.phaseRef||0));
+  err=err>=0.5?err-1:(err<-0.5?err+1:err);
+  let t=local-err*beatLen(d);
+  t=start+(((t-start)%len)+len)%len;   // cyclic position inside the region
+  if(end-t<0.002)t=start;              // a hair before the end would double-fire next tick — land on the start
+  return t; }
 function safetyStart(d){if(!d.buffer)return 0;const bar=barLen(d);
   return Math.max(0, Math.floor((d.duration-16*bar)/bar)*bar);}
 function getPos(d){
@@ -505,13 +544,20 @@ function computeRate(d){
   return r;
 }
 function applyRate(d){
-  const nr=computeRate(d); if(Math.abs(nr-d.rate)<0.0005){d.rate=nr;return;}
+  const nr=computeRate(d); if(nr===d.rate)return;
   if(d.playing&&!d.transient&&d.source){
     const p=getPos(d); d.startPos=p; d.startStamp=ctx.currentTime; d.rate=nr;
     d.source.playbackRate.setValueAtTime(nr,ctx.currentTime);
   } else d.rate=nr;
 }
-function recomputeRates(){decks.forEach(applyRate); refreshDelayTime(); updateHeader();}
+function recomputeRates(){ let loopChanged=false;
+  decks.forEach(d=>{ applyRate(d);
+    /* a loop sized under a previous sync reference (set while unsynced, or the
+       master changed since) keeps a stale length — re-derive its end from the
+       CURRENT master beat length so its cycle stays an exact # of master beats */
+    if(d.loop&&!d.removed&&d.buffer){ const nl=d.loop.start+loopSeconds(d,d.loop.sizeBeats);
+      if(Math.abs(nl-d.loop.end)>1e-4&&nl<=d.duration){ d.loop.end=nl; loopChanged=true; } } });
+  refreshDelayTime(); updateHeader(); if(loopChanged)syncLoopUI(); }
 function updateMasterBtns(){
   decks.forEach((d,i)=>{ if(!d.ui||!d.ui.masterBadge)return; const on=i===syncMasterIdx;
     d.ui.masterBadge.classList.toggle("show",on);
@@ -569,6 +615,7 @@ function jumpToSync(d){
   let target=(mPos/mBar)*barLen(d);
   target=target%d.duration; if(target<0)target+=d.duration;
   seekTo(d,target);
+  samplePhaseRef(d); // a manual Jump is a known alignment — baseline the drift guard on it
 }
 function beatJump(d,dirSign){
   if(!d.buffer)return;
@@ -582,16 +629,17 @@ function beatJump(d,dirSign){
 function setAutoLoop(d,sizeBeats){
   if(!d.buffer)return;
   if(d.loop&&d.loop.sizeBeats===sizeBeats){d.loop=null;syncLoopUI();return;}
-  const p=getPos(d), beat=beatLen(d), bar=barLen(d), len=sizeBeats*beat;
+  const p=getPos(d), beat=beatLen(d), bar=barLen(d), len=loopSeconds(d,sizeBeats);
   let anchor=sizeBeats>=4?Math.floor(p/bar)*bar:Math.floor(p/beat)*beat;
   if(anchor+len>d.duration)anchor=Math.max(0,d.duration-len);
   d.loop={start:anchor,end:anchor+len,sizeBeats}; d.loopSize=sizeBeats;
   if(d.playing&&(p<anchor||p>=anchor+len))seekTo(d,anchor);
+  if(d.playing)samplePhaseRef(d);
   syncLoopUI();
 }
 function resizeLoop(d,factor){
-  if(!d.loop)return; const beat=beatLen(d);
-  let ns=clamp(d.loop.sizeBeats*factor,0.5,32); const len=ns*beat;
+  if(!d.loop)return;
+  let ns=clamp(d.loop.sizeBeats*factor,0.5,32); const len=loopSeconds(d,ns);
   if(d.loop.start+len>d.duration)return;
   d.loop.end=d.loop.start+len; d.loop.sizeBeats=ns;
   const p=getPos(d); if(d.playing&&p>=d.loop.end)seekTo(d,d.loop.start+(p-d.loop.start)%len);
@@ -670,8 +718,28 @@ function detectBPM(buffer){
     if(den!==0){ const sh=0.5*(sL-sR)/den; if(Math.abs(sh)<1)lagF=pick+sh; }
     let bpm=60*fps/lagF;
     while(bpm<60)bpm*=2; while(bpm>180)bpm/=2;
-    const ri=Math.round(bpm); if(Math.abs(bpm-ri)<=0.5)bpm=ri; // loops are usually whole-number BPM
-    return Math.round(bpm*10)/10;
+    /* onset-interval refinement: peak-pick the kick-band envelope and measure the
+       mean beat span directly. Autocorrelation + parabolic interpolation carries a
+       systematic bias (~0.2–0.3 BPM on clean loops); averaging whole-beat spans over
+       the whole file cancels the frame quantisation (test errors ~0.01 BPM).
+       Accepted only when it agrees with the autocorrelation estimate. */
+    { const kf=new Float32Array(frames);
+      for(let f=1;f<frames;f++)kf[f]=Math.max(0,low[f]-low[f-1]);
+      const srt=Float32Array.from(kf).sort(), thr=Math.max(srt[Math.floor(frames*0.9)]*1.15,1e-4);
+      const peaks=[];
+      for(let f=2;f<frames-2;f++)
+        if(kf[f]>thr&&kf[f]>=kf[f-1]&&kf[f]>=kf[f+1]&&kf[f]>=kf[f-2]&&kf[f]>=kf[f+2])peaks.push(f);
+      if(peaks.length>=12){ const P0=fps*60/bpm;
+        let anchor=peaks[0],beats=0,lastT=peaks[0];
+        for(let i=1;i<peaks.length;i++){ const dt=peaks[i]-anchor,k=Math.round(dt/P0);
+          if(k>=1&&Math.abs(dt-k*P0)<=0.07*P0*Math.max(1,k)){beats+=k;lastT=peaks[i];anchor=peaks[i];} }
+        if(beats>=12&&lastT>peaks[0]){ let rb=60*fps/((lastT-peaks[0])/beats);
+          while(rb<60)rb*=2; while(rb>180)rb/=2;
+          if(Math.abs(rb-bpm)/bpm<0.02)bpm=rb; } } }
+    return bpm; // FULL PRECISION on purpose — the sync rate and all loop geometry consume
+                // this value. Snapping to whole BPM here (94.4 -> 94) makes a synced deck
+                // run ~0.4% off tempo and drift further on EVERY loop wrap. Rounding is
+                // applied at display sites only (see fmtBPM).
   }catch(e){ return null; }
 }
 function reverseBuffer(buffer){
@@ -721,9 +789,9 @@ function loadTrack(idx,info){
     d.cues[1]=firstOnsetTime(info.buffer);
     /* Cue 3 (vocal start) intentionally NOT auto-set in Beta 1 — no vocal stem analysis exists yet, so the pad stays honestly empty. */
     d.safetyOn=true; persistCues(d); }
-  d.pos=d.cues[0]||0; d.angle=0;
+  d.pos=d.cues[0]||0; d.angle=0; d.phaseRef=undefined; d.lastBar=-1;
   d.ui.titleEl.textContent=info.title;
-  d.ui.bpmInput.value=d.bpm; d.ui.keyInput.value=d.key;
+  d.ui.bpmInput.value=fmtBPM(d.bpm); d.ui.keyInput.value=d.key;
   refreshDeckUI(d); syncLoopUI(); renderCuesView(); renderSetView(); updateHeader();
   autoGain(d);
 }
@@ -920,7 +988,7 @@ function buildDeck(idx){
   $("#loadFile"+idx).addEventListener("click",()=>$("#file"+idx).click());
   $("#file"+idx).addEventListener("change",e=>{const f=e.target.files[0]; if(f)handleFile(idx,f); e.target.value="";});
   d.ui.bpmInput.addEventListener("change",()=>{const v=parseFloat(d.ui.bpmInput.value);
-    if(v>30&&v<300){d.bpm=v; recomputeRates(); refreshDeckUI(d);} });
+    if(v>30&&v<300){d.bpm=v; d.phaseRef=undefined; recomputeRates(); refreshDeckUI(d);} });
   d.ui.keyInput.addEventListener("change",()=>{d.key=d.ui.keyInput.value.trim()||"—"; refreshDeckUI(d); updateHeader();});
   d.pitchFader=makeVFader($("#pitch"+idx),{val:0.5,onChange:v=>{
     let pct=(v-0.5)*16; if(Math.abs(pct)<0.4)pct=0;
@@ -1113,7 +1181,7 @@ function spaceLabel(){
 }
 function updateHeader(){
   const m=decks[syncMasterIdx];
-  $("#hdrMaster").textContent=(m&&m.buffer)?`SYNC MASTER: CH ${chOf(m)} · ${m.bpm} BPM · ${m.key}`:"SYNC MASTER: —";
+  $("#hdrMaster").textContent=(m&&m.buffer)?`SYNC MASTER: CH ${chOf(m)} · ${fmtBPM(m.bpm)} BPM · ${m.key}`:"SYNC MASTER: —";
   $("#hdrClock").textContent=(m&&m.buffer)?`${(m.bpm*(m.playing?rateNow(m):computeRate(m))).toFixed(1)} BPM PLAYING · ${m.key} ${CAMELOT_CLASSIC[m.key]||""}`:"— BPM · —";
   $("#hdrFx").textContent=`FX: ${gfxOn?gfxType.toUpperCase()+" "+Math.round(gfxAmt*100)+"%":"OFF"} · SPACE: ${spaceLabel()} · AUTO GAIN ON`;
   const ss=$("#spaceState"); if(ss)ss.textContent=spaceLabel();
@@ -1275,10 +1343,10 @@ function renderCuesView(){
 }
 function renderSetView(){
   const v=$("#view-set"); const m=decks[syncMasterIdx];
-  const line=d=>d.buffer?`${d.title} · ${d.bpm} BPM · playing ${(d.bpm*(d.playing?rateNow(d):computeRate(d))).toFixed(1)} · ${d.key} · ${d.playing?"PLAYING":"stopped"} · pos ${fmtTime(getPos(d))} · loop ${d.loop?d.loop.sizeBeats+" beats":"off"} · safety ${d.safetyOn?(d.safetyCaught?"LOOPING":"armed"):"off"} · gain ${Math.round(d.gainKnob*100)}%`:"no track";
+  const line=d=>d.buffer?`${d.title} · ${fmtBPM(d.bpm)} BPM · playing ${(d.bpm*(d.playing?rateNow(d):computeRate(d))).toFixed(1)} · ${d.key} · ${d.playing?"PLAYING":"stopped"} · pos ${fmtTime(getPos(d))} · loop ${d.loop?d.loop.sizeBeats+" beats":"off"} · safety ${d.safetyOn?(d.safetyCaught?"LOOPING":"armed"):"off"} · gain ${Math.round(d.gainKnob*100)}%`:"no track";
   const chans=channelOrder().map(pos=>{const d=decks[pos];return `<b>CH ${d.ch}</b><br>${line(d)}`;}).join("<br>");
   v.innerHTML=`<div class="setGrid">
-    <div><b>SYNC MASTER</b><br>${m&&m.buffer?"CH "+chOf(m)+" · "+m.bpm+" BPM · "+m.key:"—"}<br>
+    <div><b>SYNC MASTER</b><br>${m&&m.buffer?"CH "+chOf(m)+" · "+fmtBPM(m.bpm)+" BPM · "+m.key:"—"}<br>
     <b>GLOBAL FX</b><br>${gfxOn?gfxType.toUpperCase()+" · "+Math.round(gfxAmt*100)+"%":"OFF"}<br>
     <b>MASTER SPACE</b><br>${spaceLabel()} · REV ${Math.round(spaceKnobs.revMix.val*100)}% · DLY ${Math.round(spaceKnobs.dlyMix.val*100)}%</div>
     <div>${chans}</div>
@@ -1410,7 +1478,7 @@ function drawPlatter(d){
     if(words.length<=2){ g.fillText(words.join(" ").toUpperCase().slice(0,16),0,22); }
     else{ g.fillText(words.slice(0,2).join(" ").toUpperCase().slice(0,16),0,16);
           g.fillText(words.slice(2).join(" ").toUpperCase().slice(0,16),0,32); }
-    g.font="700 8.5px system-ui"; g.fillText(d.bpm+" BPM · "+d.key,0,46);
+    g.font="700 8.5px system-ui"; g.fillText(fmtBPM(d.bpm)+" BPM · "+d.key,0,46);
     g.restore();
     g.restore();
   }
@@ -1503,14 +1571,42 @@ setInterval(()=>{
   decks.forEach(d=>{ if(d.removed||!d.playing||d.scrubbing)return;
     if(d.transient&&d.transient.kind==="start"&&(ctx.currentTime-d.transient.t0)>0.55){
       const p=getPos(d); d.transient=null; d.startPos=p; d.startStamp=ctx.currentTime;
-      if(d.source)d.source.playbackRate.value=d.rate; }
+      if(d.source)d.source.playbackRate.value=d.rate;
+      samplePhaseRef(d); } // start ramp done — baseline the drift guard on where the deck sits now
     if(d.transient)return;
-    const p=getPos(d); d.pos=p;
+    let p=getPos(d); d.pos=p;
     if(d.reverse){ if(p<=0.002){ hardStop(d); d.pos=0; } return; }
+    /* per-bar drift guard (synced decks only): phase is re-checked at each bar line
+       and only the DEVIATION from the deck's sampled reference is corrected — a file
+       whose beat 0 sits off the grid keeps its offset, but drift can never grow.
+       Corrections are instant re-phases at the bar line, never mid-bar surgery. */
+    if(d.sync&&syncMasterIdx!==d.idx){ const m=decks[syncMasterIdx];
+      if(m&&m.playing&&m.buffer&&d.buffer){
+        const barIdx=Math.floor(p/barLen(d));
+        if(d.lastBar<0)d.lastBar=barIdx;
+        if(barIdx!==d.lastBar){ d.lastBar=barIdx;
+          const pd=phaseDiffBeats(d);
+          if(pd!==null){ if(d.phaseRef===undefined)d.phaseRef=pd;
+            else{ let dev=pd-d.phaseRef; if(dev>=0.5)dev-=1; if(dev<-0.5)dev+=1;
+              if(Math.abs(dev)*beatLen(m)*1000>6){ let t=p-dev*beatLen(d);
+                if(d.loop){ const len=d.loop.end-d.loop.start;
+                  while(t<d.loop.start)t+=len; while(t>=d.loop.end)t-=len; }
+                seekTo(d,clamp(t,0,d.duration-0.01)); samplePhaseRef(d);
+                p=getPos(d); d.pos=p; } } } } } }
     if(d.loop){ if(p>=d.loop.end){ const len=d.loop.end-d.loop.start;
-        startSourceAt(d,d.loop.start+((p-d.loop.end)%Math.max(0.05,len)),true); } return; }
+        /* wrap re-anchors to the MASTER timeline (masterLoopTarget) — the wrap error
+           is recomputed from the shared clock every cycle, so it cannot compound */
+        const tgt=masterLoopTarget(d,d.loop.start,len,d.loop.sizeBeats);
+        startSourceAt(d,tgt!==null?tgt:d.loop.start+((p-d.loop.end)%Math.max(0.05,len)),true);
+        /* phaseRef is NOT re-sampled at wraps: wrap instants are tick-jittered, and
+           re-baselining here would bake that jitter into the reference itself,
+           letting it walk. The reference is sampled only at deliberate alignment
+           moments (start ramp done, Jump to Sync, loop set, bar-guard baseline). */
+        } return; }
     if(p>=d.duration-0.02){
-      if(d.safetyOn){ startSourceAt(d,safetyStart(d)+Math.max(0,p-d.duration),true);
+      if(d.safetyOn){ const ss=safetyStart(d);
+        const tgt=masterLoopTarget(d,ss,d.duration-ss,(d.duration-ss)/beatLen(d));
+        startSourceAt(d,tgt!==null?tgt:ss+Math.max(0,p-d.duration),true);
         if(!d.safetyCaught){d.safetyCaught=true; refreshDeckUI(d);} }
       else { hardStop(d); d.pos=d.duration; }
     }
@@ -1552,7 +1648,5 @@ requestAnimationFrame(frame);
 renderDrops();
 renderDemos();
 </script>
-
-<footer id="kc-site-footer" style="margin-top:40px;padding:18px 12px 24px;border-top:1px solid rgba(127,127,127,.35);text-align:center;font-size:13px;line-height:1.7;opacity:.85"><div>Copyright &copy; 2026 Keith Cole. All rights reserved.</div><div><a href="https://keithcole813.github.io/" style="color:inherit">&#8592; Back to the main page</a></div></footer>
 </body>
 </html>
